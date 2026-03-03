@@ -1,0 +1,105 @@
+<!--
+  INGEST OPERATION POLICY — applies to POST /telemetry only.
+
+  Operation-level policies are the most specific scope.
+  They run AFTER global and API-level policies (for inbound).
+
+  Concepts demonstrated:
+  1. JWT claim extraction and header injection (x-authenticated-subject)
+  2. Timestamp injection for SLA measurement
+  3. Backend routing to the named backend
+  4. Response transformation (ensure 202 status propagates correctly)
+
+  EDUCATIONAL: Why extract claims in APIM vs in the Function?
+  - The Function runs behind APIM; it shouldn't trust arbitrary caller-provided headers
+  - APIM validates the JWT (in reactor-api-policy.xml) THEN injects the claims as headers
+  - The Function trusts these APIM-injected headers since the Function key is a secret
+    only APIM holds (never exposed to clients)
+  - This creates a clean trust boundary: APIM owns AuthN, Function owns business logic
+-->
+<policies>
+  <inbound>
+    <base />  <!-- Inherit global + API-level policies (rate-limit, IP filter, JWT validation) -->
+
+    <!--
+      Extract 'sub' (subject) claim from the validated JWT and inject it as a header.
+      The Function reads x-authenticated-subject to know which regulator system sent the event.
+
+      EDUCATIONAL: JWT structure = base64(header).base64(payload).signature
+      We split on '.', take the payload (index 1), base64-decode it, parse as JSON.
+      Padding: Base64 requires length % 4 == 0; JWT omits padding, so we re-add it.
+
+      In production, consider using context.Request.Headers["Authorization"] parsing
+      more robustly, or use APIM's built-in JWT parsing context if available.
+    -->
+    <set-header name="x-authenticated-subject" exists-action="override">
+      <value>@{
+        var authHeader = context.Request.Headers.GetValueOrDefault("Authorization", "");
+        if (authHeader.StartsWith("Bearer ")) {
+          var token = authHeader.Substring(7);
+          var parts = token.Split('.');
+          if (parts.Length == 3) {
+            var payload = parts[1];
+            var paddedPayload = payload + new string('=', (4 - payload.Length % 4) % 4);
+            try {
+              var json = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(paddedPayload));
+              var claims = JObject.Parse(json);
+              return (string)claims["sub"] ?? "unknown";
+            } catch {
+              return "parse-error";
+            }
+          }
+        }
+        return "unknown";
+      }</value>
+    </set-header>
+
+    <!--
+      Inject APIM gateway timestamp so the Function can compute end-to-end latency.
+      x-apim-timestamp = when the request entered APIM.
+      The Function records when it finishes → subtract to get gateway overhead.
+    -->
+    <set-header name="x-apim-timestamp" exists-action="override">
+      <value>@(DateTime.UtcNow.ToString("o"))</value>
+    </set-header>
+
+    <!--
+      Route to the named backend defined in apim.bicep.
+      EDUCATIONAL: set-backend-service overrides the serviceUrl defined on the API.
+      Useful for: A/B testing backends, canary deployments, environment routing.
+    -->
+    <set-backend-service backend-id="reactor-ingestor-backend" />
+  </inbound>
+
+  <backend>
+    <base />
+  </backend>
+
+  <outbound>
+    <base />
+
+    <!--
+      Ensure the 202 Accepted response from the Function is preserved.
+      Add the eventId from the response body to a custom header for quick client access.
+      (Clients can read the full body OR just check the header.)
+    -->
+    <choose>
+      <when condition="@(context.Response.StatusCode == 202)">
+        <set-header name="x-event-id" exists-action="override">
+          <value>@{
+            try {
+              var body = context.Response.Body.As<JObject>(preserveContent: true);
+              return (string)body["eventId"] ?? "";
+            } catch {
+              return "";
+            }
+          }</value>
+        </set-header>
+      </when>
+    </choose>
+  </outbound>
+
+  <on-error>
+    <base />
+  </on-error>
+</policies>

@@ -1,0 +1,27 @@
+# .NET / Azure Functions
+bin/
+obj/
+.vs/
+*.user
+*.suo
+.vscode/settings.json
+local.settings.json
+
+# Bicep parameters with secrets
+main.prod.bicepparam
+
+# Environment
+.env
+.env.local
+
+# macOS
+.DS_Store
+
+# Azure Functions artifacts
+__blobstorage__
+__queuestorage__
+__azurite_db*__
+
+# Test results
+TestResults/
+coverage/

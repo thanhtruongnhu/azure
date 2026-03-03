@@ -1,0 +1,104 @@
+<!--
+  GLOBAL POLICY — applies to ALL APIs in this APIM instance.
+
+  Scope: Tenant-wide. Runs before any API-level or operation-level policy.
+
+  Good uses for global scope:
+  - CORS (applies everywhere consistently)
+  - Correlation ID injection (always useful)
+  - Strip server fingerprinting headers (security hygiene)
+  - Consistent error response format
+
+  Bad uses for global scope:
+  - Authentication (too broad — would break /health endpoints)
+  - Rate limiting (different APIs may need different limits)
+  - Backend routing (each API has its own backend)
+
+  EDUCATIONAL: Policy execution order (inbound):
+    Global → API → Operation
+  Policy execution order (outbound/on-error):
+    Operation → API → Global  (reverse)
+  <base /> element calls the parent scope's policy at that point.
+-->
+<policies>
+  <inbound>
+    <!--
+      Correlation ID injection:
+      - 'skip' means: only set it if the client didn't already provide one
+      - Client correlation IDs allow end-to-end tracing from the regulator system
+        through APIM → Function → Service Bus → downstream processors
+      - We store it in a variable so we can echo it back in the response
+    -->
+    <set-variable name="correlationId"
+                  value="@(context.Request.Headers.GetValueOrDefault(&quot;x-correlation-id&quot;, Guid.NewGuid().ToString()))" />
+    <set-header name="x-correlation-id" exists-action="override">
+      <value>@((string)context.Variables["correlationId"])</value>
+    </set-header>
+
+    <!--
+      CORS Policy:
+      - Explicitly listing origins (not wildcard) is required when using credentials
+      - In production: remove localhost, add production regulator domain
+      - OPTIONS preflight requests are automatically handled by APIM's CORS policy
+    -->
+    <cors allow-credentials="false">
+      <allowed-origins>
+        <origin>https://regulator-system.example.com</origin>
+        <origin>https://localhost:3000</origin>
+      </allowed-origins>
+      <allowed-methods preflight-result-max-age="300">
+        <method>GET</method>
+        <method>POST</method>
+        <method>OPTIONS</method>
+      </allowed-methods>
+      <allowed-headers>
+        <header>Authorization</header>
+        <header>Content-Type</header>
+        <header>x-correlation-id</header>
+      </allowed-headers>
+      <expose-headers>
+        <header>x-correlation-id</header>
+        <header>X-Rate-Limit-Remaining</header>
+        <header>Retry-After</header>
+      </expose-headers>
+    </cors>
+  </inbound>
+
+  <backend>
+    <forward-request timeout="30" />
+  </backend>
+
+  <outbound>
+    <!-- Strip server fingerprinting headers — security hygiene -->
+    <set-header name="X-Powered-By" exists-action="delete" />
+    <set-header name="X-AspNet-Version" exists-action="delete" />
+    <set-header name="X-AspNetMvc-Version" exists-action="delete" />
+    <set-header name="Server" exists-action="delete" />
+
+    <!-- Echo back the correlation ID so clients can trace their request -->
+    <set-header name="x-correlation-id" exists-action="override">
+      <value>@((string)context.Variables["correlationId"])</value>
+    </set-header>
+  </outbound>
+
+  <on-error>
+    <!--
+      Consistent error response format:
+      All errors from any API surface the same JSON structure.
+      This prevents APIM's default HTML error pages from leaking to API clients.
+    -->
+    <set-header name="Content-Type" exists-action="override">
+      <value>application/json</value>
+    </set-header>
+    <set-header name="x-correlation-id" exists-action="override">
+      <value>@((string)context.Variables["correlationId"])</value>
+    </set-header>
+    <set-body>@{
+      return new JObject(
+        new JProperty("code", context.Response.StatusCode.ToString()),
+        new JProperty("message", context.LastError.Message),
+        new JProperty("traceId", context.RequestId)
+      ).ToString();
+    }</set-body>
+  </on-error>
+</policies>

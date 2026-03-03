@@ -1,0 +1,268 @@
+openapi: 3.0.3
+info:
+  title: Reactor Telemetry API
+  description: |
+    Ingests reactor telemetry readings and incident events from regulator systems.
+    All endpoints (except /health) require a valid Bearer token issued by Azure Entra ID.
+    The API follows an asynchronous ingestion pattern: POST /telemetry returns 202 Accepted
+    and the event is processed downstream via Azure Service Bus.
+  version: 1.0.0
+  contact:
+    name: Reactor Safety Team
+    email: safety@reactorplatform.example
+
+servers:
+  - url: https://{apimName}.azure-api.net/reactor/v1
+    description: Azure API Management Gateway
+    variables:
+      apimName:
+        default: apim-reactor-dev
+        description: APIM instance name
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Telemetry
+    description: Reactor telemetry ingestion endpoints
+  - name: Health
+    description: Service health endpoints
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT issued by Azure Entra ID. The token must:
+        - Have audience: api://reactor-telemetry
+        - Include app role: telemetry.write
+
+  schemas:
+    SafetyLevel:
+      type: string
+      enum:
+        - Normal
+        - Warning
+        - Critical
+        - Emergency
+      description: |
+        Safety classification of the telemetry reading.
+        - Normal: routine operation
+        - Warning: elevated readings requiring monitoring
+        - Critical: requires immediate operator attention
+        - Emergency: automatic shutdown may be triggered
+
+    ReactorReadings:
+      type: object
+      required:
+        - coreTemperatureCelsius
+        - coolantPressureBar
+      properties:
+        coreTemperatureCelsius:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 3500
+          example: 285.4
+          description: Core temperature in Celsius (operating range 250–320°C)
+        coolantPressureBar:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 200
+          example: 155.0
+          description: Primary coolant pressure in bar (operating range 140–160 bar)
+        neutronFluxPerCm2s:
+          type: number
+          format: double
+          nullable: true
+          example: 3.2e13
+          description: Neutron flux reading (optional, instrumentation-dependent)
+
+    TelemetryEvent:
+      type: object
+      required:
+        - reactorId
+        - timestamp
+        - safetyLevel
+        - readings
+      properties:
+        reactorId:
+          type: string
+          format: uuid
+          example: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+          description: Unique identifier for the reactor unit
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-03-01T14:32:00Z"
+          description: ISO 8601 UTC timestamp of the reading
+        safetyLevel:
+          $ref: '#/components/schemas/SafetyLevel'
+        readings:
+          $ref: '#/components/schemas/ReactorReadings'
+        correlationId:
+          type: string
+          format: uuid
+          example: b9c8d7e6-f5a4-3210-fedc-ba9876543210
+          description: |
+            Client-provided idempotency key. If omitted, the server generates one.
+            Service Bus uses this as the MessageId for duplicate detection within
+            a 10-minute window.
+
+    AcceptedResponse:
+      type: object
+      properties:
+        eventId:
+          type: string
+          format: uuid
+          description: Server-assigned event ID (equals correlationId if provided)
+        status:
+          type: string
+          enum:
+            - Accepted
+        timestamp:
+          type: string
+          format: date-time
+          description: Server-side acceptance timestamp
+
+    ErrorResponse:
+      type: object
+      properties:
+        code:
+          type: string
+          description: Machine-readable error code
+          example: VALIDATION_FAILED
+        message:
+          type: string
+          description: Human-readable error description
+        errors:
+          type: array
+          items:
+            type: string
+          description: Field-level validation errors (for 400 responses)
+        traceId:
+          type: string
+          description: Distributed trace ID for correlation with Application Insights
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+            - Healthy
+        version:
+          type: string
+          example: "1.0.0"
+        timestamp:
+          type: string
+          format: date-time
+
+paths:
+  /telemetry:
+    post:
+      operationId: ingestTelemetry
+      summary: Ingest a reactor telemetry event
+      description: |
+        Validates and asynchronously ingests a reactor telemetry reading.
+        The event is published to Azure Service Bus for downstream processing:
+        - Safety Processor evaluates Warning/Critical/Emergency readings
+        - Audit Logger records all events to Table Storage
+      tags:
+        - Telemetry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TelemetryEvent'
+            examples:
+              normal:
+                summary: Normal operation reading
+                value:
+                  reactorId: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+                  timestamp: "2026-03-01T14:32:00Z"
+                  safetyLevel: Normal
+                  readings:
+                    coreTemperatureCelsius: 285.4
+                    coolantPressureBar: 155.0
+                    neutronFluxPerCm2s: 3.2e13
+              critical:
+                summary: Critical safety event
+                value:
+                  reactorId: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+                  timestamp: "2026-03-01T14:35:00Z"
+                  safetyLevel: Critical
+                  correlationId: b9c8d7e6-f5a4-3210-fedc-ba9876543210
+                  readings:
+                    coreTemperatureCelsius: 340.2
+                    coolantPressureBar: 162.8
+      responses:
+        '202':
+          description: Event accepted for asynchronous processing
+          headers:
+            x-correlation-id:
+              schema:
+                type: string
+              description: Correlation ID for distributed tracing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptedResponse'
+        '400':
+          description: Request validation failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing, invalid, or expired Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Token valid but missing required app role (telemetry.write)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: Rate limit exceeded (100 requests per 60 seconds per IP)
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+              description: Seconds until rate limit window resets
+            X-Rate-Limit-Remaining:
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Service Bus unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /health:
+    get:
+      operationId: healthCheck
+      summary: Service health check
+      description: Liveness probe. No authentication required. Used by APIM and load balancers.
+      tags:
+        - Health
+      security: []
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'

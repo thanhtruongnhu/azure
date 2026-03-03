@@ -1,0 +1,136 @@
+<!--
+  REACTOR API POLICY — applies to ALL operations of the Reactor Telemetry API.
+
+  This is the correct scope for authentication and rate limiting:
+  - Applies to POST /telemetry AND GET /health
+  - Individual operations can override or exempt themselves (see /health in the spec)
+
+  Concepts demonstrated:
+  1. rate-limit-by-key     — caller-IP-based throttling with headers
+  2. ip-filter             — allowlist known regulator IPs
+  3. validate-azure-ad-token — Entra ID JWT validation (simpler than validate-jwt)
+  4. log-to-eventhub       — structured audit logging to App Insights
+-->
+<policies>
+  <inbound>
+    <base />  <!-- Inherit global policy (CORS, correlation ID) -->
+
+    <!--
+      RATE LIMITING per caller IP address.
+
+      rate-limit-by-key vs rate-limit:
+      - rate-limit: limits per APIM subscription key (requires subscriptionRequired=true)
+      - rate-limit-by-key: limits per any expression — here we use caller IP
+
+      increment-condition: only count the call against the limit if the response
+      was NOT already a 429. Prevents "phantom" retries burning the quota.
+
+      remaining-calls-header-name: sends X-Rate-Limit-Remaining so clients can
+      implement proactive throttling.
+
+      retry-after-header-name: when limit hit, tells client when to retry (seconds).
+    -->
+    <rate-limit-by-key
+      calls="100"
+      renewal-period="60"
+      counter-key="@(context.Request.IpAddress)"
+      increment-condition="@(context.Response.StatusCode != 429)"
+      remaining-calls-header-name="X-Rate-Limit-Remaining"
+      retry-after-header-name="Retry-After" />
+
+    <!--
+      IP ALLOWLIST — only known regulator system IP ranges.
+
+      EDUCATIONAL: In production, pair with VNet injection (Premium tier) for
+      true network-layer isolation. IP filtering here is application-layer only
+      and can be spoofed if the attacker controls upstream networking.
+
+      For dev/learning: comment out the address-range and add:
+        <address>0.0.0.0</address>
+      to allow all IPs. Re-enable for realistic testing.
+    -->
+    <ip-filter action="allow">
+      <address-range from="10.0.0.0" to="10.0.255.255" />
+      <!-- Uncomment for local development testing: -->
+      <!-- <address>127.0.0.1</address> -->
+    </ip-filter>
+
+    <!--
+      JWT VALIDATION via validate-azure-ad-token (Entra ID specific).
+
+      Why use validate-azure-ad-token instead of validate-jwt?
+      - validate-jwt: generic, requires manual JWKS URI configuration
+      - validate-azure-ad-token: Entra-specific, auto-discovers signing keys
+        from https://login.microsoftonline.com/{tenantId}/.well-known/openid-configuration
+        Keys are automatically rotated — no manual key management.
+
+      tenant-id: your Entra ID tenant (set via Named Value)
+      backend-application-id: this API's app registration (the audience)
+      client-application-ids: only tokens requested BY these client apps are accepted
+
+      required-claims: enforce the 'roles' claim contains 'telemetry.write'.
+      This is an Entra ID app role — only service principals explicitly granted
+      this role via admin consent can call the API.
+
+      EDUCATIONAL: The difference between scope and roles:
+      - scope (scp claim): delegated permissions — act on behalf of a user
+      - roles claim: application permissions — service-to-service (no user context)
+      Regulator systems use client credentials (no user), so we validate 'roles'.
+    -->
+    <validate-azure-ad-token
+      tenant-id="{{EntraTenantId}}"
+      header-name="Authorization"
+      failed-validation-httpcode="401"
+      failed-validation-error-message="Invalid or expired bearer token">
+      <client-application-ids>
+        <application-id>{{RegulatorClientId}}</application-id>
+      </client-application-ids>
+      <backend-application-id>{{EntraAudienceClientId}}</backend-application-id>
+      <audiences>
+        <audience>api://reactor-telemetry</audience>
+      </audiences>
+      <required-claims>
+        <claim name="roles" match="any" separator=" ">
+          <value>telemetry.write</value>
+        </claim>
+      </required-claims>
+    </validate-azure-ad-token>
+
+    <!--
+      STRUCTURED AUDIT LOG to Application Insights.
+
+      Every authenticated API request is logged with:
+      - caller IP
+      - operation ID (which endpoint was called)
+      - correlation ID (links to downstream traces)
+
+      This log is queryable in App Insights / Log Analytics:
+        traces
+        | where customDimensions.event == "ApiRequest"
+        | project timestamp, callerIp, operationId, correlationId
+    -->
+    <log-to-eventhub logger-id="appinsights-logger" partition-id="0">
+      @{
+        return new JObject(
+          new JProperty("event", "ApiRequest"),
+          new JProperty("operationId", context.Operation.Id),
+          new JProperty("callerIp", context.Request.IpAddress),
+          new JProperty("correlationId", context.Request.Headers.GetValueOrDefault("x-correlation-id", "")),
+          new JProperty("timestamp", DateTime.UtcNow.ToString("o"))
+        ).ToString();
+      }
+    </log-to-eventhub>
+  </inbound>
+
+  <backend>
+    <base />
+  </backend>
+
+  <outbound>
+    <base />
+  </outbound>
+
+  <on-error>
+    <base />
+  </on-error>
+</policies>

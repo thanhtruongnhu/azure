@@ -1,0 +1,15 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
+    "APPLICATIONINSIGHTS_CONNECTION_STRING": "",
+
+    "ServiceBusConnection__fullyQualifiedNamespace": "<your-sb-namespace>.servicebus.windows.net",
+    "ServiceBusTopic": "reactor-events",
+    "ServiceBusSubscription": "<safety-processor | audit-logger>",
+
+    "AuditStorageConnection__accountName": "devstoreaccount1",
+    "AuditTableName": "reactorauditlog"
+  }
+}
