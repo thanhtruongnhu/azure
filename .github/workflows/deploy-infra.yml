@@ -1,0 +1,93 @@
+# EDUCATIONAL: Infrastructure deployment workflow
+#
+# Triggers on push to main when infra/** files change.
+# Uses OIDC (no stored secrets) to authenticate to Azure.
+#
+# Deployment strategy: az deployment sub create (idempotent)
+# - Bicep/ARM deployments are idempotent: running the same template twice
+#   results in the same state. Resources are created if missing, updated if different.
+# - 'complete' mode: removes resources NOT in the template (dangerous in production)
+# - 'incremental' mode (default): only adds/updates, never deletes
+#
+# Outputs from the deployment are captured and posted as a workflow summary,
+# giving you the APIM gateway URL immediately after deployment.
+
+name: Deploy Infrastructure
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - 'api/**'           # OpenAPI spec changes may trigger APIM re-import
+      - '.github/workflows/deploy-infra.yml'
+  workflow_dispatch:       # Allow manual trigger from GitHub UI
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  DEPLOYMENT_LOCATION: eastus
+
+jobs:
+  deploy-infra:
+    name: Deploy Bicep to Azure
+    runs-on: ubuntu-latest
+    environment: dev           # GitHub environment for approval gates (optional)
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Bicep
+        run: az bicep install
+
+      # EDUCATIONAL: Validate before deploying — catches errors without creating resources
+      - name: Validate Bicep template
+        run: |
+          az deployment sub validate \
+            --name "infra-validate-${{ github.run_number }}" \
+            --location ${{ env.DEPLOYMENT_LOCATION }} \
+            --template-file infra/main.bicep \
+            --parameters infra/main.bicepparam
+
+      # The actual deployment — idempotent, incremental mode
+      - name: Deploy infrastructure
+        id: deploy
+        run: |
+          OUTPUT=$(az deployment sub create \
+            --name "infra-${{ github.run_number }}" \
+            --location ${{ env.DEPLOYMENT_LOCATION }} \
+            --template-file infra/main.bicep \
+            --parameters infra/main.bicepparam \
+            --output json)
+
+          # Extract outputs and expose them as step outputs
+          APIM_URL=$(echo $OUTPUT | jq -r '.properties.outputs.apimGatewayUrl.value')
+          RG_NAME=$(echo $OUTPUT | jq -r '.properties.outputs.resourceGroupName.value')
+          INGESTOR_NAME=$(echo $OUTPUT | jq -r '.properties.outputs.ingestorFunctionAppName.value')
+
+          echo "apim_url=$APIM_URL" >> $GITHUB_OUTPUT
+          echo "resource_group=$RG_NAME" >> $GITHUB_OUTPUT
+          echo "ingestor_name=$INGESTOR_NAME" >> $GITHUB_OUTPUT
+
+      # Post a deployment summary visible in the GitHub Actions UI
+      - name: Write deployment summary
+        run: |
+          echo "## Infrastructure Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| APIM Gateway URL | ${{ steps.deploy.outputs.apim_url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource Group | ${{ steps.deploy.outputs.resource_group }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ingestor Function App | ${{ steps.deploy.outputs.ingestor_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployment # | ${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY

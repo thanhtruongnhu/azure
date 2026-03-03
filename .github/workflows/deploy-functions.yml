@@ -1,0 +1,150 @@
+# EDUCATIONAL: Azure Functions deployment workflow
+#
+# Triggers on push to main when src/** files change.
+# Builds all three Function projects, publishes each as a zip, deploys via az functionapp.
+#
+# Deployment strategy: zip deploy (Kudu)
+# - az functionapp deployment source config-zip
+# - Atomic: the new zip is extracted atomically, no partial-state downtime
+# - Alternative: Deployment slots (staging → production swap) for zero-downtime deploys
+#   (requires Premium/Standard App Service Plan — not available on Consumption)
+#
+# Matrix strategy: runs all three function deployments in parallel (faster).
+# Each matrix job builds and deploys one Function App.
+
+name: Deploy Functions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - '.github/workflows/deploy-functions.yml'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  DOTNET_VERSION: '8.0.x'
+
+jobs:
+  # ── Build all functions first (fast, parallel publish) ──────────────────────
+  build:
+    name: Build & Publish
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - project: TelemetryIngestor/ReactorTelemetry.Ingestor
+            artifact: ingestor
+          - project: SafetyProcessor/ReactorTelemetry.SafetyProcessor
+            artifact: safety-processor
+          - project: AuditLogger/ReactorTelemetry.AuditLogger
+            artifact: audit-logger
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.lock.json') }}
+
+      - name: Restore
+        run: dotnet restore src/ReactorTelemetry.sln
+
+      - name: Test
+        run: dotnet test src/ReactorTelemetry.sln --no-restore --configuration Release
+
+      # EDUCATIONAL: dotnet publish --output creates a self-contained deployment artifact.
+      # The zip is what gets uploaded to the Function App via Kudu.
+      - name: Publish ${{ matrix.project }}
+        run: |
+          dotnet publish src/${{ matrix.project }} \
+            --configuration Release \
+            --output publish/${{ matrix.artifact }}
+
+      - name: Zip artifact
+        run: |
+          cd publish/${{ matrix.artifact }}
+          zip -r ../../${{ matrix.artifact }}.zip .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+          retention-days: 1
+
+  # ── Deploy all three function apps in parallel ───────────────────────────────
+  deploy:
+    name: Deploy to Azure
+    runs-on: ubuntu-latest
+    needs: build
+    environment: dev
+    strategy:
+      matrix:
+        include:
+          - artifact: ingestor
+            app_name_secret: INGESTOR_FUNCTION_APP_NAME
+          - artifact: safety-processor
+            app_name_secret: SAFETY_PROCESSOR_FUNCTION_APP_NAME
+          - artifact: audit-logger
+            app_name_secret: AUDIT_LOGGER_FUNCTION_APP_NAME
+
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+
+      # EDUCATIONAL: az functionapp deployment source config-zip
+      # Uploads the zip to the Kudu (SCM) endpoint of the Function App.
+      # The Function App restarts automatically after the zip is deployed.
+      - name: Deploy ${{ matrix.artifact }}
+        run: |
+          az functionapp deployment source config-zip \
+            --name ${{ secrets[matrix.app_name_secret] }} \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --src ${{ matrix.artifact }}.zip \
+            --build-remote false
+
+      - name: Verify deployment
+        run: |
+          echo "Deployed ${{ matrix.artifact }} to ${{ secrets[matrix.app_name_secret] }}"
+          az functionapp show \
+            --name ${{ secrets[matrix.app_name_secret] }} \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --query "state" -o tsv
+
+  # ── Post-deploy smoke test ───────────────────────────────────────────────────
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run smoke test
+        env:
+          APIM_GATEWAY_URL: ${{ secrets.APIM_GATEWAY_URL }}
+          ENTRA_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ENTRA_CLIENT_ID: ${{ secrets.SMOKE_TEST_CLIENT_ID }}
+          ENTRA_CLIENT_SECRET: ${{ secrets.SMOKE_TEST_CLIENT_SECRET }}
+          ENTRA_AUDIENCE: ${{ secrets.ENTRA_AUDIENCE_CLIENT_ID }}
+        run: bash scripts/seed-test-data.sh --smoke-test

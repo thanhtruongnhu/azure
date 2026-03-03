@@ -1,0 +1,129 @@
+# EDUCATIONAL: PR validation workflow
+#
+# Triggers on every pull request to main. Provides fast feedback before merge.
+# Three parallel jobs: dotnet build+test, Bicep lint, Bicep what-if preview.
+#
+# Key concepts:
+# - OIDC federated credentials: no stored secrets. GitHub asks Azure for a token.
+#   Required Azure setup: az ad app federated-credential create
+# - permissions: id-token: write — required for OIDC token request
+# - Bicep what-if: shows what WOULD change without making any real changes
+#   Great for PR reviews — reviewers can see infrastructure impact.
+
+name: PR Validate
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write   # Required for OIDC authentication to Azure
+  contents: read
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  # ── Job 1: Build and test .NET code ─────────────────────────────────────────
+  dotnet-build-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      # Cache NuGet packages to speed up subsequent runs
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.lock.json') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      - name: Restore dependencies
+        run: dotnet restore src/ReactorTelemetry.sln
+
+      - name: Build (no restore)
+        run: dotnet build src/ReactorTelemetry.sln --no-restore --configuration Release
+
+      - name: Run tests
+        run: >
+          dotnet test src/ReactorTelemetry.sln
+          --no-build
+          --configuration Release
+          --logger "trx;LogFileName=test-results.trx"
+          --results-directory ./test-results
+          --collect:"XPlat Code Coverage"
+
+      # Publish test results as a PR check annotation
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: xUnit Tests
+          path: test-results/*.trx
+          reporter: dotnet-trx
+
+  # ── Job 2: Bicep lint ────────────────────────────────────────────────────────
+  bicep-lint:
+    name: Bicep Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Azure CLI
+        uses: azure/setup-azure-cli@v1
+
+      - name: Install Bicep
+        run: az bicep install
+
+      # 'az bicep build' compiles Bicep to ARM JSON and reports syntax/type errors
+      - name: Lint Bicep templates
+        run: |
+          az bicep build --file infra/main.bicep
+          echo "Bicep lint passed"
+
+  # ── Job 3: Bicep what-if (infra preview) ────────────────────────────────────
+  bicep-what-if:
+    name: Bicep What-If
+    runs-on: ubuntu-latest
+    # Only run what-if if Bicep lint passed
+    needs: [bicep-lint]
+    # Skip if infra/ wasn't changed (saves time on code-only PRs)
+    if: |
+      contains(github.event.pull_request.changed_files, 'infra/') ||
+      github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      # EDUCATIONAL: OIDC login — no secrets stored in GitHub.
+      # Azure setup required:
+      #   az ad app create --display-name "github-actions-reactor"
+      #   az ad sp create --id <appId>
+      #   az ad app federated-credential create --id <appId> --parameters '{
+      #     "name": "github-pr",
+      #     "issuer": "https://token.actions.githubusercontent.com",
+      #     "subject": "repo:<owner>/<repo>:pull_request",
+      #     "audiences": ["api://AzureADTokenExchange"]
+      #   }'
+      #   az role assignment create --assignee <appId> --role Contributor --scope /subscriptions/<id>
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Bicep What-If
+        run: |
+          az deployment sub what-if \
+            --name "pr-${{ github.event.pull_request.number }}-preview" \
+            --location eastus \
+            --template-file infra/main.bicep \
+            --parameters infra/main.bicepparam \
+            --result-format FullResourcePayloads
